@@ -27,7 +27,7 @@ from pathlib import Path
 import requests
 
 from wb_parser import (
-    DEFAULT_DEST, Item, _memory_order, _model_order, collect, filter_items,
+    Item, _memory_order, _model_order, collect, filter_items,
     fmt_rub, save_results, setup_logging,
 )
 from wb_token import TokenStore
@@ -321,7 +321,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("-p", "--max-pages", type=int, default=100)
     ap.add_argument("--delay-min", type=float, default=1.0)
     ap.add_argument("--delay-max", type=float, default=3.0)
-    ap.add_argument("--dest", default=DEFAULT_DEST)
+    ap.add_argument("--dest", help="регион доставки WB; по умолчанию из cURL или Москва")
     ap.add_argument("--min-price", type=float, default=20000)
     ap.add_argument("--min-drop-pct", type=float, default=3.0,
                     help="сообщать, если товар подешевел минимум на столько %%")

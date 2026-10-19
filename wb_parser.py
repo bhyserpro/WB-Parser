@@ -83,14 +83,14 @@ class Item:
 
 
 def build_session(tokens: TokenStore) -> requests.Session:
-    """Создаёт сессию с cookie и User-Agent того браузера, что прошёл проверку."""
+    """Создаёт сессию с cookie, заголовками и User-Agent браузера, прошедшего проверку."""
     session = requests.Session()
-    tokens.apply(session)
     session.headers.update({
         "Accept": "*/*",
         "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
         "Referer": f"{SITE}/catalog/0/search.aspx",
     })
+    tokens.apply(session)  # заголовки из импортированного cURL перекрывают стандартные
     return session
 
 
@@ -98,21 +98,27 @@ def fetch_page(
     session: requests.Session,
     query: str,
     page: int,
-    dest: str = DEFAULT_DEST,
+    dest: str | None = None,
     retries: int = 5,
     timeout: float = 20.0,
+    base_params: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Загружает одну страницу выдачи и возвращает JSON.
 
     Повторяет запрос с экспоненциальной паузой при 429/5xx, таймаутах и
     обрывах. При 401/403/498 бросает ``TokenRejected``: токен надо обновить.
+    ``base_params`` — параметры из запроса браузера (импорт cURL); ``dest``,
+    если задан, перекрывает регион из них.
     """
     params = {
-        "ab_testing": "false", "appType": "1", "curr": "rub", "dest": dest,
-        "lang": "ru", "locale": "ru", "page": str(page), "query": query,
-        "resultset": "catalog", "sort": "popular", "spp": "30",
-        "suppressSpellcheck": "false",
+        "ab_testing": "false", "appType": "1", "curr": "rub", "dest": DEFAULT_DEST,
+        "lang": "ru", "locale": "ru", "resultset": "catalog", "sort": "popular",
+        "spp": "30", "suppressSpellcheck": "false",
+        **(base_params or {}),
+        "page": str(page), "query": query,
     }
+    if dest:
+        params["dest"] = dest
     for attempt in range(retries + 1):
         try:
             resp = session.get(SEARCH_API, params=params, timeout=timeout)
@@ -276,7 +282,7 @@ def collect(
     tokens: TokenStore,
     max_pages: int = 100,
     delay: tuple[float, float] = (1.0, 3.0),
-    dest: str = DEFAULT_DEST,
+    dest: str | None = None,
     dump_raw: Path | None = None,
 ) -> list[Item]:
     """Проходит страницы выдачи, пока они не кончатся, и возвращает товары."""
@@ -287,7 +293,7 @@ def collect(
     page = 1
     while page <= max_pages:
         try:
-            data = fetch_page(session, query, page, dest)
+            data = fetch_page(session, query, page, dest, base_params=tokens.base_params)
         except TokenRejected as exc:
             if refreshed:
                 raise
@@ -422,7 +428,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="не фильтровать аксессуары и прочие товары")
     ap.add_argument("--min-price", type=float, default=20000,
                     help="нижняя граница цены смартфона, ₽ (отсекает аксессуары)")
-    ap.add_argument("--dest", default=DEFAULT_DEST, help="регион доставки WB (параметр dest)")
+    ap.add_argument("--dest", help=f"регион доставки WB (параметр dest); по умолчанию — из "
+                    f"импортированного cURL, иначе {DEFAULT_DEST} (Москва)")
     ap.add_argument("--profile-dir", type=Path, default=Path(".wb_profile"),
                     help="профиль браузера для получения токена")
     ap.add_argument("--headless", action="store_true",

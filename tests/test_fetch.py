@@ -35,6 +35,7 @@ class FakeSession:
 class FakeTokens:
     def __init__(self):
         self.refreshed = 0
+        self.base_params = {"dest": "123", "uclusters": "2"}
 
     def apply(self, session, query="iPhone 16"):
         pass
@@ -91,3 +92,11 @@ def test_max_pages_limit(monkeypatch):
     s = FakeSession([Resp(200, page(1)), Resp(200, page(2)), Resp(200, page(3))])
     monkeypatch.setattr(wb_parser, "build_session", lambda tokens: s)
     assert len(collect("iPhone 16", FakeTokens(), max_pages=2)) == 2 and len(s.calls) == 2
+    # параметры браузера сохраняются, query/page — наши
+    assert s.calls[1]["uclusters"] == "2" and s.calls[1]["dest"] == "123" and s.calls[1]["page"] == "2"
+
+
+def test_dest_overrides_base_params():
+    s = FakeSession([Resp(200, page(1))])
+    fetch_page(s, "iPhone 16", 1, dest="-1", base_params={"dest": "123", "query": "x"})
+    assert s.calls[0]["dest"] == "-1" and s.calls[0]["query"] == "iPhone 16"

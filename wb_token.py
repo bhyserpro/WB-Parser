@@ -23,7 +23,7 @@ import shlex
 import sys
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlsplit
 
 import requests
 
@@ -31,6 +31,8 @@ log = logging.getLogger("wb_token")
 
 SITE = "https://www.wildberries.ru"
 TOKEN_COOKIE = "x_wbaas_token"
+# заголовки из cURL, которые не переносим в сессию: их выставляет сам requests
+SKIP_HEADERS = {"cookie", "host", "content-length", "accept-encoding", "connection"}
 IMPORT_HINT = (
     "Возьмите токен из своего браузера: DevTools → Network → запрос search → "
     "Copy as cURL (bash) → сохраните в curl.txt → python wb_token.py import --curl curl.txt"
@@ -60,6 +62,8 @@ class TokenStore:
         self.browser_channel = browser_channel
         self.cookies: list[dict] = []
         self.user_agent = ""
+        self.headers: dict[str, str] = {}
+        self.base_params: dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -69,6 +73,7 @@ class TokenStore:
         except (OSError, ValueError):
             return
         self.cookies, self.user_agent = data.get("cookies", []), data.get("user_agent", "")
+        self.headers, self.base_params = data.get("headers", {}), data.get("base_params", {})
 
     def save(self, source: str) -> None:
         """Записывает токен в кэш (файл локальный и в .gitignore)."""
@@ -76,6 +81,8 @@ class TokenStore:
         self.cache_path.write_text(json.dumps({
             "cookies": self.cookies,
             "user_agent": self.user_agent,
+            "headers": self.headers,
+            "base_params": self.base_params,
             "source": source,
             "obtained_at": datetime.now().isoformat(timespec="seconds"),
         }, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -86,9 +93,10 @@ class TokenStore:
         return any(c.get("name") == TOKEN_COOKIE for c in self.cookies)
 
     def apply(self, session: requests.Session, query: str = "iPhone 16") -> None:
-        """Кладёт cookie и User-Agent в сессию; при пустом кэше получает токен."""
+        """Кладёт cookie, заголовки и User-Agent в сессию; при пустом кэше получает токен."""
         if not self.has_token:
             self.refresh(query)
+        session.headers.update(self.headers)
         for c in self.cookies:
             session.cookies.set(c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/"))
         if self.user_agent:
@@ -137,6 +145,7 @@ class TokenStore:
                     ) from exc
                 self.user_agent = page.evaluate("navigator.userAgent")
                 self.cookies = ctx.cookies(SITE)
+                self.headers, self.base_params = {}, {}
             finally:
                 ctx.close()
         if not self.has_token:
@@ -145,17 +154,29 @@ class TokenStore:
         log.info("Токен получен и сохранён в %s", self.cache_path)
 
     def import_curl(self, text: str) -> None:
-        """Берёт cookie и User-Agent из команды «Copy as cURL (bash)»."""
-        cookies, ua = parse_curl(text)
+        """Берёт URL, заголовки и cookie из команды «Copy as cURL (bash)».
+
+        Повторяем запрос браузера целиком: те же заголовки и параметры URL
+        (кроме query и page), чтобы WB видел тот же запрос, что и от сайта.
+        """
+        req = parse_curl(text)
+        cookies = req["cookies"]
         if TOKEN_COOKIE not in cookies:
             raise ValueError(
                 f"В команде нет cookie {TOKEN_COOKIE}. Скопируйте запрос search с "
                 "wildberries.ru именно как «Copy as cURL (bash)» после загрузки выдачи."
             )
-        self.import_values(cookies, ua)
+        headers = {k: v for k, v in req["headers"].items() if k.lower() not in SKIP_HEADERS}
+        ua = next((v for k, v in headers.items() if k.lower() == "user-agent"), "")
+        params = {k: v for k, v in req["params"].items() if k not in ("query", "page")}
+        self.import_values(cookies, ua, headers, params)
 
-    def import_values(self, cookies: dict[str, str], user_agent: str) -> None:
-        """Сохраняет cookie и User-Agent, полученные вручную."""
+    def import_values(
+        self, cookies: dict[str, str], user_agent: str,
+        headers: dict[str, str] | None = None, base_params: dict[str, str] | None = None,
+    ) -> None:
+        """Сохраняет cookie, User-Agent и (необязательно) заголовки и параметры запроса."""
+        self.headers, self.base_params = headers or {}, base_params or {}
         self.cookies = [
             {"name": k, "value": v, "domain": "www.wildberries.ru", "path": "/"} for k, v in cookies.items()
         ]
@@ -163,28 +184,39 @@ class TokenStore:
         self.save("import")
 
 
-def parse_curl(text: str) -> tuple[dict[str, str], str]:
-    """Разбирает «Copy as cURL (bash)»: возвращает (cookie, User-Agent)."""
+def parse_curl(text: str) -> dict:
+    """Разбирает «Copy as cURL (bash)»: URL, параметры, заголовки, cookie."""
     text = text.strip()
     if text.startswith("curl ^") or '^"' in text:
         raise ValueError("Это формат cmd. В DevTools выберите «Copy as cURL (bash)».")
     args = shlex.split(text.replace("\\\r\n", " ").replace("\\\n", " "))
-    cookie_header, ua = "", ""
-    for flag, value in zip(args, args[1:]):
-        if flag in ("-b", "--cookie"):
-            cookie_header = value
-        elif flag in ("-H", "--header"):
+    url, headers, cookie_header = "", {}, ""
+    i = 1
+    while i < len(args):
+        arg = args[i]
+        value = args[i + 1] if i + 1 < len(args) else ""
+        if arg in ("-H", "--header"):
             name, _, val = value.partition(":")
             if name.strip().lower() == "cookie":
                 cookie_header = val.strip()
-            elif name.strip().lower() == "user-agent":
-                ua = val.strip()
-        elif flag in ("-A", "--user-agent"):
-            ua = value
+            else:
+                headers[name.strip()] = val.strip()
+            i += 2
+        elif arg in ("-b", "--cookie"):
+            cookie_header, i = value, i + 2
+        elif arg in ("-A", "--user-agent"):
+            headers["user-agent"], i = value, i + 2
+        elif arg in ("-X", "--request", "--data", "--data-raw", "-d"):
+            i += 2
+        elif arg.startswith("http"):
+            url, i = arg, i + 1
+        else:
+            i += 1  # --compressed и прочие флаги без значения
     cookies = dict(
         part.strip().split("=", 1) for part in cookie_header.split(";") if "=" in part
     )
-    return cookies, ua
+    return {"url": url, "params": dict(parse_qsl(urlsplit(url).query)),
+            "headers": headers, "cookies": cookies}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -224,9 +256,13 @@ def main(argv: list[str] | None = None) -> int:
     from wb_parser import build_session, fetch_page
     from wb_token import TokenRejected as ParserTokenRejected
     try:
-        data = fetch_page(build_session(store), "iPhone 16", 1, retries=1)
+        data = fetch_page(build_session(store), "iPhone 16", 1, retries=1,
+                          base_params=store.base_params)
     except (TokenRejected, ParserTokenRejected) as exc:
         print(f"Токен не принят: {exc}", file=sys.stderr)
+        print("Проверьте, проходит ли тот же запрос из терминала: выполните команду из curl.txt "
+              "в Git Bash (Windows) или Терминале (macOS/Linux). Пришлите, что ответит — "
+              "первые строки и код ответа.", file=sys.stderr)
         return 1
     products = data.get("products") or (data.get("data") or {}).get("products") or []
     print(f"Токен работает: на первой странице {len(products)} товаров")
