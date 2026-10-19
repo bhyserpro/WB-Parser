@@ -23,6 +23,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 import requests
 
@@ -290,28 +291,49 @@ def load_env(path: Path = Path(".env")) -> None:
 # ------------------------------------------------------------------ запуск
 
 
-def run_once(args: argparse.Namespace, tokens: TokenStore, notify) -> None:
-    """Один цикл: сбор → сохранение → анализ → уведомление."""
-    now = datetime.now()
-    items = collect(args.query, tokens, args.max_pages, (args.delay_min, args.delay_max), args.dest)
-    items = filter_items(items, min_price=args.min_price)
+def analyze_and_report(
+    items: list[Item], query: str, db: Path, min_drop_pct: float, min_drop_rub: float,
+    notify: Callable[[str], None], now: datetime | None = None, export: Path | None = None,
+) -> dict:
+    """Сохраняет снимок цен, ищет снижения и отправляет отчёт. Возвращает итоги."""
+    now = now or datetime.now()
     if not items:
-        raise RuntimeError("После фильтра не осталось ни одного товара — проверьте выдачу (--dump-raw)")
-    if args.export:
-        save_results(items, args.export)
-    conn = open_db(args.db)
+        raise RuntimeError("После фильтра не осталось ни одного товара — проверьте выдачу")
+    if export:
+        save_results(items, export)
+    conn = open_db(db)
     try:
-        run_id = store_run(conn, args.query, items, now.isoformat(timespec="seconds"))
-        prev_id = previous_run(conn, args.query, run_id)
-        drops = find_price_drops(conn, items, run_id, args.min_drop_pct, args.min_drop_rub, now)
-        segments = find_segment_drops(conn, items, prev_id, args.min_drop_rub)
+        run_id = store_run(conn, query, items, now.isoformat(timespec="seconds"))
+        prev_id = previous_run(conn, query, run_id)
+        drops = find_price_drops(conn, items, run_id, min_drop_pct, min_drop_rub, now)
+        segments = find_segment_drops(conn, items, prev_id, min_drop_rub)
     finally:
         conn.close()
     log.info("Товаров %d, снижений %d, новых минимумов по сегментам %d",
              len(items), len(drops), len(segments))
-    text = format_report(args.query, now, items, drops, segments, first_run=prev_id is None)
+    text = format_report(query, now, items, drops, segments, first_run=prev_id is None)
     if text:
         notify(text)
+    return {"items": len(items), "drops": len(drops), "segments": len(segments),
+            "first_run": prev_id is None, "notified": bool(text)}
+
+
+def run_once(args: argparse.Namespace, tokens: TokenStore, notify: Callable[[str], None]) -> None:
+    """Один цикл: сбор → сохранение → анализ → уведомление."""
+    items = collect(args.query, tokens, args.max_pages, (args.delay_min, args.delay_max), args.dest)
+    items = filter_items(items, min_price=args.min_price)
+    analyze_and_report(items, args.query, args.db, args.min_drop_pct, args.min_drop_rub,
+                       notify, export=args.export)
+
+
+def make_notifier(dry_run: bool = False) -> Callable[[str], None]:
+    """Отправка в Telegram по TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID, иначе — печать в консоль."""
+    tg_token, tg_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if dry_run or not (tg_token and tg_chat):
+        if not dry_run:
+            log.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сообщения только в консоль")
+        return lambda text: print("\n" + text + "\n")
+    return lambda text: send_telegram(tg_token, tg_chat, text)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -347,13 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     load_env()
     args = build_arg_parser().parse_args(argv)
     setup_logging(args.verbose)
-    tg_token, tg_chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if args.dry_run or not (tg_token and tg_chat):
-        if not args.dry_run:
-            log.warning("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID не заданы — сообщения только в консоль")
-        notify = lambda text: print("\n" + text + "\n")  # noqa: E731
-    else:
-        notify = lambda text: send_telegram(tg_token, tg_chat, text)  # noqa: E731
+    notify = make_notifier(args.dry_run)
     tokens = TokenStore(args.profile_dir, headless=args.headless,
                         use_browser=not args.no_browser, browser_channel=args.browser_channel)
 
