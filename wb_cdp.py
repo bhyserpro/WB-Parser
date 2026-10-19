@@ -115,7 +115,7 @@ def wait_challenge(page: Any, notify: Callable[[str], None], timeout_s: float) -
 
 def collect_pages(
     page: Any, collector: ResponseCollector, url: str, max_pages: int, notify: Callable[[str], None],
-    wait_s: float = 30, scrolls: int = 3, delay: tuple[float, float] = (1.0, 3.0),
+    wait_s: float = 30, scrolls: int = 0, delay: tuple[float, float] = (1.0, 3.0),
     challenge_wait_s: float = 600, dump_raw: Path | None = None,
 ) -> list[dict]:
     """Открывает страницы выдачи по очереди и возвращает товары из ответов сайта."""
@@ -126,7 +126,9 @@ def collect_pages(
             page.goto(page_url(url, n), wait_until="domcontentloaded")
             deadline = time.time() + wait_s
             while time.time() < deadline and not collector.responses and not is_challenge(page):
-                page.wait_for_timeout(500)
+                page.wait_for_timeout(200)
+            if collector.responses:
+                page.wait_for_timeout(700)  # сайт мог сделать ещё запросы следом
             if is_challenge(page) or (not collector.responses and 498 in collector.statuses):
                 wait_challenge(page, notify, challenge_wait_s)
                 continue  # после проверки — та же страница ещё раз
@@ -152,26 +154,48 @@ def collect_pages(
     return products
 
 
-def select_target(items: list[Item], model: str | None, memory: str | None) -> list[Item]:
-    """Оставляет только нужную модель и объём памяти."""
-    return [it for it in items
-            if (not model or it.model == model) and (not memory or it.memory == memory)]
+BLOCKED_TYPES = {"image", "media", "font"}
+
+
+def block_heavy_resources(page: Any) -> None:
+    """Не грузить в своей вкладке картинки, видео и шрифты — страницы открываются в разы быстрее."""
+    page.route("**/*", lambda route: route.abort() if route.request.resource_type in BLOCKED_TYPES
+               else route.continue_())
+
+
+def select_target(
+    items: list[Item], model: str | None, memory: str | None,
+    min_rating: float = 0, min_feedbacks: int = 0, min_seller_rating: float = 0,
+) -> list[Item]:
+    """Оставляет нужную модель и память и (если заданы) хорошие карточки и продавцов."""
+    return [
+        it for it in items
+        if (not model or it.model == model) and (not memory or it.memory == memory)
+        and (not min_rating or (it.rating or 0) >= min_rating)
+        and (not min_feedbacks or (it.feedbacks or 0) >= min_feedbacks)
+        and (not min_seller_rating or (it.seller_rating or 0) >= min_seller_rating)
+    ]
 
 
 def cheapest_text(items: list[Item], top: int = 10) -> str:
     """Короткий список самых дешёвых предложений для консоли."""
     rows = sorted((it for it in items if it.price), key=lambda it: it.price)[:top]
-    return "\n".join(f"  {fmt_rub(it.price):>10}  {it.seller or '—'}  {it.url}" for it in rows)
+    return "\n".join(
+        f"  {fmt_rub(it.price):>10}  ★{it.rating or '—'} ({it.feedbacks or 0} отз.)  "
+        f"{it.seller or '—'} ★{it.seller_rating or '—'}  {it.url}"
+        for it in rows)
 
 
 def run_cycle(args: argparse.Namespace, page: Any, collector: ResponseCollector,
               notify: Callable[[str], None]) -> dict:
     """Один проход: выдача → фильтр → история → уведомление о снижениях."""
-    raw = collect_pages(page, collector, args.url, args.max_pages, notify,
+    raw = collect_pages(page, collector, args.url, args.max_pages, notify, scrolls=args.scrolls,
                         delay=(args.delay_min, args.delay_max), dump_raw=args.dump_raw)
     now = datetime.now()
     items = dedupe_items(parse_items({"products": raw}, now.isoformat(timespec="seconds")))
-    items = select_target(filter_items(items, min_price=args.min_price), args.model, args.memory)
+    items = filter_items(items, min_price=args.min_price, include_refurbished=args.include_refurbished)
+    items = select_target(items, args.model, args.memory,
+                          args.min_rating, args.min_feedbacks, args.min_seller_rating)
     log.info("Предложений %s %s: %d. Самые дешёвые:\n%s",
              args.model, args.memory or "", len(items), cheapest_text(items))
     label = " ".join(p for p in (args.model, args.memory) if p)
@@ -192,6 +216,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--delay-min", type=float, default=1.0)
     ap.add_argument("--delay-max", type=float, default=3.0)
     ap.add_argument("--min-price", type=float, default=20000)
+    ap.add_argument("--include-refurbished", action="store_true",
+                    help="не отсекать восстановленные / б/у / уценённые")
+    ap.add_argument("--min-rating", type=float, default=0, help="мин. рейтинг карточки (0 — любой)")
+    ap.add_argument("--min-feedbacks", type=int, default=0, help="мин. число отзывов карточки")
+    ap.add_argument("--min-seller-rating", type=float, default=0, help="мин. рейтинг продавца")
+    ap.add_argument("--scrolls", type=int, default=0, help="прокруток на странице (0 — не крутить)")
+    ap.add_argument("--load-images", action="store_true", help="грузить картинки (медленнее)")
     ap.add_argument("--min-drop-pct", type=float, default=0.0, help="порог снижения, %% (0 — любое)")
     ap.add_argument("--min-drop-rub", type=float, default=1.0, help="порог снижения, ₽")
     ap.add_argument("--db", type=Path, default=Path("data/prices.sqlite"))
@@ -221,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
         collector = ResponseCollector()
         context.on("response", collector)
         page = context.new_page()  # своя вкладка — ваши вкладки скрипт не трогает
+        if not args.load_images:
+            block_heavy_resources(page)
         try:
             while True:
                 try:

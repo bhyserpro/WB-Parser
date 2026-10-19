@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from wb_cdp import ResponseCollector, page_url, run_cycle
+from wb_cdp import ResponseCollector, block_heavy_resources, page_url, run_cycle
 
 sync_api = pytest.importorskip("playwright.sync_api")
 
@@ -36,7 +36,8 @@ def prod(pid, name, rub, seller="Магазин"):
 PAGES = {
     1: [prod(1, "Apple iPhone 16 Pro 256 ГБ Desert Titanium", 99000, "Дешёвый"),
         prod(2, "Apple iPhone 16 Pro 128 ГБ", 95000),
-        prod(3, "Чехол iPhone 16 Pro 256", 900)],
+        prod(3, "Чехол iPhone 16 Pro 256", 900),
+        prod(6, "Apple iPhone 16 Pro 256 ГБ восстановленный", 70000)],
     2: [prod(4, "Смартфон iPhone 16 Pro 256GB", 101000), prod(5, "iPhone 16 Pro Max 256 ГБ", 120000)],
 }
 PRICE = {"p1": 99000}
@@ -99,13 +100,15 @@ def test_cdp_end_to_end(tmp_path):
             collector = ResponseCollector()
             context.on("response", collector)
             page = context.new_page()
+            block_heavy_resources(page)
             sent = []
             args = Namespace(url=base + "/catalog/0/search.aspx?search=x&sort=priceup", max_pages=5,
                              delay_min=0.05, delay_max=0.1, dump_raw=tmp_path / "raw", min_price=20000,
                              model="iPhone 16 Pro", memory="256 ГБ", db=tmp_path / "db.sqlite",
-                             min_drop_pct=0.0, min_drop_rub=1.0, export=None)
+                             min_drop_pct=0.0, min_drop_rub=1.0, export=None, scrolls=0,
+                             include_refurbished=False, min_rating=0, min_feedbacks=0, min_seller_rating=0)
             res = run_cycle(args, page, collector, sent.append)
-            assert res["items"] == 2 and res["first_run"]           # 1 и 4: Pro 256; 128, Max и чехол — мимо
+            assert res["items"] == 2 and res["first_run"]           # 1 и 4: Pro 256; 128, Max, чехол и восстановленный — мимо
             assert "База создана" in sent[-1] and "99 000 ₽" in sent[-1]
             assert len(list((tmp_path / "raw").glob("cdp_*.json"))) == 3       # 2 страницы + пустая 3-я
 

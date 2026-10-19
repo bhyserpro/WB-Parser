@@ -50,6 +50,12 @@ ACCESSORY_WORDS = (
     "повербанк", "павербанк", "переходник", "футляр", "протектор", "запчаст",
     "case", "glass", "cable", "cover", "magsafe",
 )
+# восстановленные, б/у, уценка, витринные — не «новые»
+REFURB_RE = re.compile(
+    r"восстановлен|refurb|renewed|\bреф\b|как\s+нов|б\s*/\s*у|\bбу\b|уценк|витрин|"
+    r"\bcpo\b|\bused\b|пользован|в\s+отличном\s+состоянии|в\s+хорошем\s+состоянии",
+    re.IGNORECASE,
+)
 KNOWN_COLORS = (
     "black titanium", "white titanium", "natural titanium", "desert titanium",
     "черный титан", "чёрный титан", "белый титан", "натуральный титан",
@@ -77,6 +83,8 @@ class Item:
     feedbacks: int | None
     url: str
     collected_at: str
+    seller_rating: float | None = None
+    refurbished: bool = False
 
 
 # ---------------------------------------------------------------- загрузка
@@ -234,11 +242,18 @@ def parse_items(data: dict[str, Any], collected_at: str) -> list[Item]:
             feedbacks=p.get("nmFeedbacks") if p.get("nmFeedbacks") is not None else p.get("feedbacks"),
             url=f"{SITE}/catalog/{p['id']}/detail.aspx",
             collected_at=collected_at,
+            seller_rating=p.get("supplierRating"),
+            refurbished=is_refurbished_name(name),
         ))
     return items
 
 
 # ---------------------------------------------------------- фильтр и дедуп
+
+
+def is_refurbished_name(name: str) -> bool:
+    """True, если по названию товар восстановленный, б/у или уценённый."""
+    return bool(REFURB_RE.search(name or ""))
 
 
 def is_accessory(item: Item) -> bool:
@@ -248,12 +263,14 @@ def is_accessory(item: Item) -> bool:
 
 
 def filter_items(
-    items: Iterable[Item], include_accessories: bool = False, min_price: float = 20000
+    items: Iterable[Item], include_accessories: bool = False, min_price: float = 20000,
+    include_refurbished: bool = False,
 ) -> list[Item]:
-    """Оставляет только смартфоны iPhone 16 / Plus / Pro / Pro Max в наличии.
+    """Оставляет только новые смартфоны iPhone 16 / Plus / Pro / Pro Max в наличии.
 
     Признаки смартфона: модель из линейки в названии, нет слов-аксессуаров,
     цена не ниже ``min_price`` (аксессуары без стоп-слов отсекаются ценой).
+    Восстановленные, б/у и уценённые отсекаются, если не ``include_refurbished``.
     """
     items = list(items)
     if include_accessories:
@@ -264,6 +281,7 @@ def filter_items(
         and not is_accessory(it)
         and it.price is not None
         and it.price >= min_price
+        and (include_refurbished or not it.refurbished)
     ]
     log.info("Фильтр: оставлено %d из %d", len(kept), len(items))
     return kept
@@ -329,6 +347,7 @@ FIELD_TITLES = {
     "price_basic": "Цена без скидки, ₽", "discount_pct": "Скидка, %",
     "seller": "Продавец", "seller_id": "ID продавца", "rating": "Рейтинг",
     "feedbacks": "Отзывов", "url": "Ссылка", "collected_at": "Дата сбора",
+    "seller_rating": "Рейтинг продавца", "refurbished": "Восстановленный/б/у",
 }
 
 

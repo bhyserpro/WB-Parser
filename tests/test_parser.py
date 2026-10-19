@@ -74,3 +74,19 @@ def test_summary():
     text = summarize(items)
     assert "Всего товаров: 3" in text and "медиана 90 000 ₽" in text
     assert "iPhone 16 Pro 256 ГБ: 90 000 ₽" in text
+
+
+def test_refurbished_filtered_out():
+    data = {"products": [
+        product(1, "Смартфон iPhone 16 Pro 256 ГБ", 9900000),
+        product(2, "iPhone 16 Pro 256 ГБ восстановленный", 7000000),
+        product(3, "Apple iPhone 16 Pro 256GB Refurbished", 7100000),
+        product(4, "iPhone 16 Pro 256 ГБ (как новый)", 7200000),
+        product(5, "iPhone 16 Pro 256 ГБ б/у", 6000000),
+        product(6, "iPhone 16 Pro 256 ГБ уценка", 8000000),
+        product(7, "iPhone 16 Pro 256 ГБ, Desert Titanium, eSIM", 9800000, supplierRating=4.9),
+    ]}
+    items = parse_items(data, TS)
+    assert [it.id for it in filter_items(items)] == [1, 7]
+    assert len(filter_items(items, include_refurbished=True)) == 7
+    assert items[6].seller_rating == 4.9 and items[1].refurbished
