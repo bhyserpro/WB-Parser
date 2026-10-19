@@ -427,6 +427,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="профиль браузера для получения токена")
     ap.add_argument("--headless", action="store_true",
                     help="браузер без окна (WB часто такой не пускает)")
+    ap.add_argument("--browser-channel", choices=["chrome", "msedge"],
+                    help="взять установленный Chrome/Edge вместо встроенного Chromium")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="не открывать браузер: только токен, импортированный через wb_token.py import")
     ap.add_argument("--dump-raw", type=Path, help="сохранять сырые JSON-ответы в папку")
     ap.add_argument("-v", "--verbose", action="store_true", help="подробный лог")
     return ap
@@ -447,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(args.verbose)
     if args.delay_min > args.delay_max:
         args.delay_min, args.delay_max = args.delay_max, args.delay_min
-    tokens = TokenStore(args.profile_dir, headless=args.headless)
+    tokens = TokenStore(args.profile_dir, headless=args.headless,
+                        use_browser=not args.no_browser, browser_channel=args.browser_channel)
     items = collect(args.query, tokens, args.max_pages,
                     (args.delay_min, args.delay_max), args.dest, args.dump_raw)
     items = filter_items(items, args.include_accessories, args.min_price)

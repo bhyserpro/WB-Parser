@@ -331,6 +331,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--export", type=Path, help="также сохранять XLSX/CSV каждого запуска")
     ap.add_argument("--profile-dir", type=Path, default=Path(".wb_profile"))
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--browser-channel", choices=["chrome", "msedge"])
+    ap.add_argument("--no-browser", action="store_true",
+                    help="не открывать браузер: только импортированный токен")
     group = ap.add_mutually_exclusive_group()
     group.add_argument("--once", action="store_true", help="один запуск (для cron/планировщика)")
     group.add_argument("--interval", type=int, default=3600, help="период повторения, с")
@@ -351,7 +354,8 @@ def main(argv: list[str] | None = None) -> int:
         notify = lambda text: print("\n" + text + "\n")  # noqa: E731
     else:
         notify = lambda text: send_telegram(tg_token, tg_chat, text)  # noqa: E731
-    tokens = TokenStore(args.profile_dir, headless=args.headless)
+    tokens = TokenStore(args.profile_dir, headless=args.headless,
+                        use_browser=not args.no_browser, browser_channel=args.browser_channel)
 
     while True:
         try:
