@@ -23,22 +23,37 @@ SCRIPT = Path(__file__).resolve().parent.parent / "wb-monitor.user.js"
 PAGE = """<!doctype html><html><body><h1>fake wb</h1><div id="list"></div>
 <script>
 const MODE = '%MODE%';
+const API = '/__internal/search/exactmatch/ru/common/v18/search?appType=1&dest=777&query=iphone+16&page=';
 let page = +(new URLSearchParams(location.search).get('page') || 1), loading = false, end = false;
+const rub = (k) => (k / 100).toLocaleString('ru-RU').replace(/\\s/g, '\\u00a0') + '\\u00a0₽';
+let worker;
+if (MODE === 'worker') {   // запросы из Web Worker перехват страницы не видит
+  const code = "onmessage = (e) => fetch(e.data).then(r => r.json()).then(d => postMessage(d))";
+  worker = new Worker(URL.createObjectURL(new Blob([code])));
+}
+function get(p) {
+  if (!worker) return fetch(API + p).then(r => r.ok ? r.json() : {products: []});
+  return new Promise((res) => { worker.onmessage = (e) => res(e.data); worker.postMessage(location.origin + API + p); });
+}
+function render(d, p) {
+  const box = document.createElement('div');
+  box.style.minHeight = '3000px';
+  for (const x of d.products) {
+    const pr = x.sizes[0].price;
+    box.insertAdjacentHTML('beforeend',
+      `<article class="product-card" data-nm-id="${x.id}"><a href="/catalog/${x.id}/detail.aspx" aria-label="${x.name}">` +
+      `<span class="product-card__brand">Apple</span><span class="product-card__name">/ ${x.name}</span>` +
+      `<ins class="price__lower-price">${rub(pr.product)}</ins><del>${rub(pr.basic)}</del>` +
+      `<span class="address-rate-mini">4,8</span><span class="product-card__count">1 234 оценки</span></a></article>`);
+  }
+  document.getElementById('list').appendChild(box);
+}
 function load(p) {
   loading = true;
-  return fetch('/__internal/search/exactmatch/ru/common/v18/search?appType=1&dest=777&query=iphone+16&page=' + p)
-    .then(r => r.ok ? r.json() : {products: []})
-    .then(d => {
-      if (!d.products.length) end = true;
-      const div = document.createElement('div');
-      div.style.height = '3000px';
-      div.textContent = 'page ' + p;
-      document.getElementById('list').appendChild(div);
-      loading = false;
-    });
+  return get(p).then(d => { if (!d.products.length) end = true; render(d, p); loading = false; });
 }
 load(page);
-if (MODE === 'scroll') {
+if (MODE !== 'pages') {
   window.addEventListener('scroll', () => {
     if (!loading && !end && innerHeight + scrollY >= document.body.scrollHeight - 100) load(++page);
   });
@@ -153,19 +168,32 @@ def check_ingest(posted, sent):
 
 def test_infinite_scroll(tmp_path):
     badge, posted, sent = run_script(tmp_path, "scroll")
-    assert "страниц 3, iPhone 3, снижений 0" in badge
+    assert "ответов API 3\niPhone 3, снижений 0" in badge
     assert FakeWB.calls == [1, 2, 3, 4]   # скрипт сам ничего не запрашивал — только сайт
     check_ingest(posted, sent)
 
 
 def test_page_navigation_fallback(tmp_path):
     badge, posted, sent = run_script(tmp_path, "pages")
-    assert "страниц 3, iPhone 3" in badge
+    assert "ответов API 3\niPhone 3" in badge
     assert FakeWB.calls == [1, 2, 3, 4]
     check_ingest(posted, sent)
 
 
 def test_site_requests_rejected(tmp_path):
     badge, posted, sent = run_script(tmp_path, "scroll", api_status=403, wait_for="ошибка")
+    # сайт получил 403 и ничего не показал — после повторов ошибка
     assert "WB отклоняет запросы самого сайта: HTTP 403" in badge
     assert posted == [] and sent == []    # первая ошибка — без уведомления, повтор позже
+
+
+def test_dom_fallback_when_api_not_visible(tmp_path):
+    badge, posted, sent = run_script(tmp_path, "worker")
+    assert "с карточек 6 (без продавца)\niPhone 3" in badge
+    url, body = posted[0]
+    assert [p["page"] for p in body["pages"]] == ["dom"]
+    first = body["pages"][0]["products"][0]
+    assert first == {"id": 11, "name": "Apple iPhone 16 Pro 256 ГБ", "brand": "Apple", "reviewRating": 4.8,
+                     "feedbacks": 1234, "sizes": [{"price": {"product": 9100000, "basic": 12000000}}],
+                     "source": "dom"}
+    assert "База создана" in sent[0] and "91 000 ₽" in sent[0]

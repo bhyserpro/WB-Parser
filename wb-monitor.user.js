@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WB iPhone 16 — мониторинг цен
 // @namespace    https://github.com/bhyserpro/WB-Parser
-// @version      2.0.0
+// @version      2.1.0
 // @description  Раз в час собирает выдачу Wildberries в этой вкладке и отправляет в локальный receiver.py
 // @match        https://www.wildberries.ru/*
 // @grant        GM_xmlhttpRequest
@@ -30,8 +30,11 @@
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
   const CONFIG = Object.assign({
     query: 'iPhone 16',
+    // Свой адрес выдачи с фильтрами (категория «Смартфоны», бренд Apple и т.п.):
+    // настройте фильтры на сайте и скопируйте адрес страницы сюда. null — поиск по query.
+    searchUrl: null,
     intervalMin: 60,          // период сбора
-    maxPages: 100,            // максимум страниц выдачи
+    maxPages: 50,             // максимум страниц выдачи (по ~100 товаров)
     delayMinMs: 1000,         // пауза между прокрутками/переходами 1–3 с
     delayMaxMs: 3000,
     waitResponseMs: 30000,    // сколько ждать ответа сайта после загрузки страницы
@@ -189,12 +192,29 @@
 
   // ------------------------------------------------------------------ сбор
 
+  /** Адрес выдачи: свой (с фильтрами из CONFIG.searchUrl) или поиск по query. */
   function searchUrl(page) {
-    const url = new URL('/catalog/0/search.aspx', location.origin);
+    const url = CONFIG.searchUrl
+      ? new URL(CONFIG.searchUrl, location.origin)
+      : new URL('/catalog/0/search.aspx', location.origin);
+    if (!CONFIG.searchUrl) url.searchParams.set('search', CONFIG.query);
+    url.hash = '';
     if (page > 1) url.searchParams.set('page', String(page));
-    url.searchParams.set('sort', 'popular');
-    url.searchParams.set('search', CONFIG.query);
+    else url.searchParams.delete('page');
     return url.toString();
+  }
+
+  /** Адрес без page и якоря, с упорядоченными параметрами — для сравнения. */
+  function normalizeUrl(href) {
+    const url = new URL(href, location.origin);
+    url.hash = '';
+    url.searchParams.delete('page');
+    url.searchParams.sort();
+    return url.pathname + '?' + url.searchParams.toString().toLowerCase();
+  }
+
+  function currentPage() {
+    return Number(new URLSearchParams(location.search).get('page') || '1');
   }
 
   function go(url) {
@@ -202,40 +222,81 @@
     location.href = url;
   }
 
-  /** Ждёт следующего ответа поиска (или null по таймауту). */
-  function nextCapture(timeoutMs, fromIndex) {
-    if (captured.length > fromIndex) return Promise.resolve(captured[fromIndex]);
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => { onCapture = () => {}; resolve(null); }, timeoutMs);
-      onCapture = (entry) => { clearTimeout(timer); onCapture = () => {}; resolve(entry); };
-    });
+  /** Карточки товаров на странице — запасной источник, если ответы API не перехватились. */
+  function parseCards() {
+    const digits = (el) => Number(((el && el.textContent) || '').replace(/\D/g, '')) || null;
+    let nodes = [...document.querySelectorAll('[data-nm-id]')];
+    if (!nodes.length) {
+      nodes = [...document.querySelectorAll('a[href*="/detail.aspx"]')]
+        .map((a) => a.closest('article, li, [class*="card"]') || a);
+    }
+    const out = [];
+    const seen = new Set();
+    for (const card of nodes) {
+      const link = card.matches('a[href*="/detail.aspx"]') ? card : card.querySelector('a[href*="/detail.aspx"]');
+      const fromLink = ((link && link.getAttribute('href')) || '').match(/catalog\/(\d+)\//);
+      const id = Number(card.getAttribute('data-nm-id')) || Number(fromLink && fromLink[1]);
+      if (!id || seen.has(id)) continue;
+      const text = (sel) => ((card.querySelector(sel) || {}).textContent || '').trim();
+      const name = (text('.product-card__name') ||
+        (card.querySelector('[aria-label]') || { getAttribute: () => '' }).getAttribute('aria-label') ||
+        (card.querySelector('img[alt]') || {}).alt || '').replace(/^[\s/]+/, '').trim();
+      let price = digits(card.querySelector('ins, .price__lower-price, [class*="lower-price"]'));
+      let basic = digits(card.querySelector('del, [class*="old-price"]'));
+      if (!price) {
+        const all = [...card.textContent.matchAll(/(\d[\d\s   ]*)\s*₽/g)]
+          .map((m) => Number(m[1].replace(/\D/g, ''))).filter(Boolean);
+        if (all.length) { price = Math.min(...all); basic = basic || Math.max(...all); }
+      }
+      if (!name || !price) continue;
+      seen.add(id);
+      const rating = parseFloat(text('.address-rate-mini, [class*="rating"]').replace(',', '.'));
+      out.push({
+        id,
+        name,
+        brand: text('.product-card__brand'),
+        reviewRating: Number.isFinite(rating) && rating <= 5 ? rating : undefined,
+        feedbacks: digits(card.querySelector('.product-card__count, [class*="count"]')) || undefined,
+        sizes: [{ price: { product: price * 100, basic: basic && basic > price ? basic * 100 : undefined } }],
+        source: 'dom',
+      });
+    }
+    return out;
   }
 
-  /** Записывает пойманные страницы в сбор; возвращает true, если выдача кончилась. */
+  /** Переносит пойманные ответы API и карточки со страницы в сбор. */
   function absorb(run) {
-    let ended = false;
     for (const entry of captured) {
       if (!entry.products) continue;
-      if (!entry.products.length) { ended = true; continue; }
+      if (!entry.products.length) { run.ended = true; continue; }
       if (entry.page <= CONFIG.maxPages && !run.pages[entry.page]) run.pages[entry.page] = entry.products;
     }
+    for (const p of parseCards()) if (!run.dom[p.id]) run.dom[p.id] = p;
     saveRun(run);
-    const count = Object.keys(run.pages).length;
-    return ended || count >= CONFIG.maxPages;
+    return { api: Object.keys(run.pages).length, dom: Object.keys(run.dom).length };
   }
+
+  const limitReached = (c) => c.api >= CONFIG.maxPages || c.dom >= CONFIG.maxPages * 100;
 
   async function finish(run, note) {
     const pages = Object.keys(run.pages).map(Number).sort((a, b) => a - b)
       .map((n) => ({ page: n, products: run.pages[n] }));
-    status(`отправка в receiver.py: страниц ${pages.length}…`);
+    // карточки, которых нет в ответах API (их receiver склеит по артикулу)
+    const apiIds = new Set(pages.flatMap((p) => p.products.map((x) => x.id)));
+    const domOnly = Object.values(run.dom).filter((p) => !apiIds.has(p.id));
+    if (domOnly.length) pages.push({ page: 'dom', products: domOnly });
+    if (!pages.length) return fail(run, 'не удалось получить ни одного товара');
+    status(`отправка в receiver.py…`);
     const res = await send('/ingest', { query: CONFIG.query, pages, page_url: location.href });
     saveRun(null);
     GM_setValue('failures', 0);
-    const intervalMs = CONFIG.intervalMin * 60000;
     GM_setValue('lastRun', run.startedAt);
-    const text = `${fmtTime(run.startedAt)}: страниц ${pages.length}, iPhone ${res.items}, снижений ${res.drops}` +
+    const source = Object.keys(run.pages).length
+      ? `ответов API ${Object.keys(run.pages).length}` + (domOnly.length ? `, с карточек ${domOnly.length}` : '')
+      : `с карточек ${domOnly.length} (без продавца)`;
+    const text = `${fmtTime(run.startedAt)}: ${source}\niPhone ${res.items}, снижений ${res.drops}` +
       (note ? `\n${note}` : '');
-    status(scheduleNext(run.startedAt + intervalMs + rand(-60000, 60000) - Date.now(), text), 'ok');
+    status(scheduleNext(run.startedAt + CONFIG.intervalMin * 60000 + rand(-60000, 60000) - Date.now(), text), 'ok');
   }
 
   async function fail(run, message) {
@@ -253,48 +314,54 @@
   async function step(run) {
     const expected = run.expect;
     status(`сбор: жду выдачу (страница ${expected})…`);
-    const first = await nextCapture(CONFIG.waitResponseMs, 0);
-    if (!first) {
-      run.navFailures = (run.navFailures || 0) + 1;
-      saveRun(run);
-      if (run.navFailures > 2) return fail(run, 'сайт не загрузил выдачу (нет ответа поиска)');
-      return go(searchUrl(expected));
+    const t0 = Date.now();
+    while (Date.now() - t0 < CONFIG.waitResponseMs && !captured.some((e) => e.products) && !parseCards().length) {
+      await sleep(500);
     }
-    const ok = captured.filter((e) => e.products);
-    if (!ok.length) {
-      const codes = [...new Set(captured.map((e) => e.status))].join(', ');
+    const searchCodes = [...new Set(captured.filter((e) => !e.products).map((e) => e.status))];
+    if (!captured.some((e) => e.products) && !parseCards().length) {
       run.navFailures = (run.navFailures || 0) + 1;
       saveRun(run);
-      if (run.navFailures > 3) return fail(run, `WB отклоняет запросы самого сайта: HTTP ${codes}`);
+      const why = searchCodes.length
+        ? `WB отклоняет запросы самого сайта: HTTP ${searchCodes.join(', ')}`
+        : 'на странице нет ни товаров, ни ответов поиска';
+      if (run.navFailures > 3) return fail(run, why);
       await sleep(rand(CONFIG.reloadDelayMs[0], CONFIG.reloadDelayMs[1]));
       return go(searchUrl(expected));   // перезагрузка — сайт пройдёт проверку заново
     }
     run.navFailures = 0;
-    if (expected > 1 && !captured.some((e) => e.page === expected)) {
-      // сайт открыл не ту страницу — значит, &page=N он не поддерживает
-      absorb(run);
-      return finish(run, `сайт не открывает &page=${expected}, собрано что удалось`);
-    }
-
-    // прокрутка: сайт сам подгружает следующие страницы
-    let ended = absorb(run);
-    let lastNew = Date.now();
-    let seen = captured.length;
-    while (!ended && Date.now() - lastNew < CONFIG.scrollStallMs) {
-      pageWindow.scrollTo(0, document.documentElement.scrollHeight);
-      status(`сбор: страниц ${Object.keys(run.pages).length}, прокрутка…`);
-      await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
-      if (captured.length > seen) {
-        seen = captured.length;
-        lastNew = Date.now();
-        ended = absorb(run);
+    const firstIds = parseCards().slice(0, 5).map((p) => p.id);
+    if (expected > 1) {
+      const apiWrongPage = captured.some((e) => e.products) && !captured.some((e) => e.page === expected);
+      const domRepeat = !captured.some((e) => e.products) && firstIds.length && firstIds.every((id) => run.dom[id]);
+      if (apiWrongPage || domRepeat) {
+        // сайт открыл не ту страницу — значит, &page=N он не поддерживает
+        absorb(run);
+        return finish(run, `сайт не открывает &page=${expected}, собрано что удалось`);
       }
     }
-    if (ended) return finish(run);
+
+    // прокрутка: сайт сам подгружает следующие товары
+    let counts = absorb(run);
+    let lastNew = Date.now();
+    while (!run.ended && !limitReached(counts) && Date.now() - lastNew < CONFIG.scrollStallMs) {
+      pageWindow.scrollTo(0, document.documentElement.scrollHeight);
+      status(`сбор: ответов API ${counts.api}, карточек ${counts.dom}, прокрутка…`);
+      await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
+      const now = absorb(run);
+      if (now.api > counts.api || now.dom > counts.dom) lastNew = Date.now();
+      counts = now;
+    }
+    if (!captured.length && !run.loggedNoApi) {
+      const seenInNetwork = performance.getEntriesByType('resource').filter((e) => isSearchUrl(e.name)).length;
+      log(`перехват не поймал ответов API (в Network запросов поиска: ${seenInNetwork}) — беру данные с карточек`);
+      run.loggedNoApi = true;
+    }
+    if (run.ended || limitReached(counts)) return finish(run);
 
     // прокрутка больше ничего не даёт — открываем следующую страницу по адресу
-    const have = Object.keys(run.pages).map(Number);
-    run.expect = Math.max(...have) + 1;
+    const apiPages = Object.keys(run.pages).map(Number);
+    run.expect = apiPages.length ? Math.max(...apiPages) + 1 : currentPage() + 1;
     saveRun(run);
     await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
     return go(searchUrl(run.expect));
@@ -340,19 +407,16 @@
       status(scheduleNext(wait, last ? `последний запуск в ${fmtTime(last)}` : 'ожидание'));
       return;
     }
-    const fresh = { startedAt: Date.now(), expect: 1, pages: {}, navFailures: 0 };
+    const fresh = { startedAt: Date.now(), expect: 1, pages: {}, dom: {}, navFailures: 0 };
     saveRun(fresh);
     if (onFirstSearchPage()) return step(fresh).catch((e) => fail(fresh, e.message));
     status('сбор: открываю выдачу…');
     go(searchUrl(1));   // свежая загрузка, чтобы перехват поймал первую страницу
   }
 
-  /** Открыта ли уже первая страница выдачи по нашему запросу (перехват её поймал или поймает). */
+  /** Открыта ли уже первая страница нужной выдачи (тогда начинаем без перезагрузки). */
   function onFirstSearchPage() {
-    const params = new URLSearchParams(location.search);
-    return location.pathname.endsWith('/search.aspx') &&
-      (params.get('search') || '').trim().toLowerCase() === CONFIG.query.trim().toLowerCase() &&
-      Number(params.get('page') || '1') === 1;
+    return currentPage() === 1 && normalizeUrl(location.href) === normalizeUrl(searchUrl(1));
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', main);
