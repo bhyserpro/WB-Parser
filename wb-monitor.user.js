@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WB iPhone 16 — мониторинг цен
 // @namespace    https://github.com/bhyserpro/WB-Parser
-// @version      1.0.0
+// @version      2.0.0
 // @description  Раз в час собирает выдачу Wildberries в этой вкладке и отправляет в локальный receiver.py
 // @match        https://www.wildberries.ru/*
 // @grant        GM_xmlhttpRequest
@@ -10,7 +10,8 @@
 // @grant        unsafeWindow
 // @connect      127.0.0.1
 // @connect      localhost
-// @run-at       document-idle
+// @run-at       document-start
+// @inject-into  page
 // @noframes
 // ==/UserScript==
 
@@ -18,6 +19,10 @@
  * Работает только во вкладке, открытой по адресу с #wb-monitor:
  *   https://www.wildberries.ru/catalog/0/search.aspx?search=iPhone%2016#wb-monitor
  * Остальные вкладки WB скрипт не трогает. Выключить: открыть адрес с #wb-monitor-off.
+ *
+ * Скрипт не делает собственных запросов к API WB. Выдачу запрашивает сам сайт —
+ * при открытии страницы поиска, прокрутке вниз и переходе на &page=N, — а скрипт
+ * только читает эти ответы и пересылает их в receiver.py.
  */
 (function () {
   'use strict';
@@ -27,17 +32,18 @@
     query: 'iPhone 16',
     intervalMin: 60,          // период сбора
     maxPages: 100,            // максимум страниц выдачи
-    delayMinMs: 1000,         // пауза между страницами 1–3 с
+    delayMinMs: 1000,         // пауза между прокрутками/переходами 1–3 с
     delayMaxMs: 3000,
+    waitResponseMs: 30000,    // сколько ждать ответа сайта после загрузки страницы
+    scrollStallMs: 15000,     // сколько крутить без новых ответов, прежде чем перейти на &page=N
     retryMin: 5,              // повтор после ошибки
+    reloadDelayMs: [5000, 10000],  // пауза перед перезагрузкой после отказа WB
+    runTimeoutMin: 30,        // предел длительности одного сбора
     challengeAlertMin: 10,    // сообщить, если проверка WB висит дольше
     receiver: 'http://127.0.0.1:8765',
   }, pageWindow.WB_MONITOR_CONFIG || {});
 
   const FLAG = 'wbMonitorTab';
-  const DEFAULT_API = 'https://www.wildberries.ru/__internal/search/exactmatch/ru/common/v18/search' +
-    '?ab_testing=false&appType=1&curr=rub&dest=-1257786&lang=ru&locale=ru&resultset=catalog' +
-    '&sort=popular&spp=30&suppressSpellcheck=false';
   const KEEP_FIELDS = ['id', 'name', 'brand', 'supplier', 'supplierId', 'reviewRating', 'rating',
     'feedbacks', 'nmFeedbacks', 'colors', 'salePriceU', 'priceU'];
 
@@ -48,13 +54,96 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const rand = (a, b) => a + Math.random() * (b - a);
   const fmtTime = (ts) => new Date(ts).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  const log = (...a) => console.info('[WB-мониторинг]', ...a);
 
-  class TokenError extends Error {}
+  // ---------------------------------------------------------------- состояние
+
+  /** Текущий сбор переживает перезагрузки вкладки: хранится в GM-хранилище. */
+  const loadRun = () => GM_getValue('run', null);
+  const saveRun = (run) => GM_setValue('run', run);
+
+  // -------------------------------------------- перехват ответов самого сайта
+
+  const captured = [];         // ответы поиска, пойманные за эту загрузку страницы
+  let onCapture = () => {};
+
+  function trimProduct(p) {
+    const out = {};
+    for (const k of KEEP_FIELDS) if (p[k] !== undefined) out[k] = p[k];
+    out.sizes = (p.sizes || []).map((s) => ({ name: s.name, origName: s.origName, price: s.price }));
+    return out;
+  }
+
+  function isSearchUrl(url) {
+    return url.includes('/__internal/search/') && url.includes('/search?');
+  }
+
+  function handleResponse(rawUrl, status, text) {
+    try {
+      const url = new URL(String(rawUrl), location.href);
+      const entry = { page: Number(url.searchParams.get('page') || '1'), status: Number(status) };
+      if (entry.status === 200) {
+        const data = JSON.parse(String(text));
+        const products = data.products || (data.data && data.data.products) || [];
+        entry.products = products.map(trimProduct);
+      }
+      captured.push(entry);
+      log(`ответ сайта: страница ${entry.page}, HTTP ${entry.status}, товаров ${entry.products ? entry.products.length : '—'}`);
+      onCapture(entry);
+    } catch (e) {
+      log('не удалось разобрать ответ поиска', e);
+    }
+  }
+
+  /** Обёртки fetch и XHR страницы; в режиме content-скрипта Firefox — через exportFunction. */
+  function installHooks() {
+    const w = pageWindow;
+    const exp = (fn) => (typeof exportFunction === 'function' ? exportFunction(fn, w) : fn);
+
+    const origFetch = w.fetch;
+    w.fetch = exp(function (input) {
+      const promise = origFetch.apply(this, arguments);
+      try {
+        const url = String(typeof input === 'string' ? input : (input && input.url) || '');
+        if (isSearchUrl(url)) {
+          promise.then((r) => r.clone().text().then((t) => handleResponse(url, r.status, t))).catch(() => {});
+        }
+      } catch (e) { /* не мешаем сайту */ }
+      return promise;
+    });
+
+    const proto = w.XMLHttpRequest.prototype;
+    const origOpen = proto.open;
+    const origSend = proto.send;
+    proto.open = exp(function (method, url) {
+      try { this.__wbMonitorUrl = String(url); } catch (e) { /* ignore */ }
+      return origOpen.apply(this, arguments);
+    });
+    proto.send = exp(function () {
+      const xhr = this;
+      try {
+        if (xhr.__wbMonitorUrl && isSearchUrl(xhr.__wbMonitorUrl)) {
+          xhr.addEventListener('load', exp(() => {
+            let text = '';
+            try {
+              text = xhr.responseType === '' || xhr.responseType === 'text'
+                ? xhr.responseText : JSON.stringify(xhr.response);
+            } catch (e) { /* ignore */ }
+            handleResponse(xhr.__wbMonitorUrl, xhr.status, text);
+          }));
+        }
+      } catch (e) { /* ignore */ }
+      return origSend.apply(this, arguments);
+    });
+  }
+
+  installHooks();
 
   // ---------------------------------------------------------------- статус
 
   let badge;
   function status(text, kind = 'info') {
+    if (!document.body) return;
     if (!badge) {
       badge = document.createElement('div');
       badge.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:2147483647;max-width:320px;' +
@@ -100,109 +189,133 @@
 
   // ------------------------------------------------------------------ сбор
 
-  /** URL поиска, которым пользовался сам сайт (с вашим регионом), или стандартный. */
-  async function findApiTemplate() {
-    for (let i = 0; i < 30; i++) {
-      const entry = performance.getEntriesByType('resource')
-        .map((e) => e.name)
-        .find((n) => n.includes('/__internal/search/') && n.includes('/search?'));
-      if (entry) return entry;
-      await sleep(1000);
-    }
-    return DEFAULT_API;
-  }
-
-  function pageUrl(template, page) {
-    const url = new URL(template, location.origin);
-    url.searchParams.set('query', CONFIG.query);
-    url.searchParams.set('page', String(page));
+  function searchUrl(page) {
+    const url = new URL('/catalog/0/search.aspx', location.origin);
+    if (page > 1) url.searchParams.set('page', String(page));
+    url.searchParams.set('sort', 'popular');
+    url.searchParams.set('search', CONFIG.query);
     return url.toString();
   }
 
-  /** Запрос от имени страницы — с её cookie, как это делает сам сайт. */
-  async function fetchJson(url, retries = 4) {
-    const pageFetch = pageWindow.fetch.bind(pageWindow);
-    for (let attempt = 0; ; attempt++) {
-      let resp = null;
-      let reason;
-      try {
-        resp = await pageFetch(url);
-      } catch (e) {
-        reason = `сеть: ${e.message}`;
-      }
-      if (resp) {
-        if ([401, 403, 498].includes(resp.status)) throw new TokenError(`WB отклонил запрос: HTTP ${resp.status}`);
-        if (resp.ok) return JSON.parse(await resp.text());
-        reason = `HTTP ${resp.status}`;
-        if (![429, 500, 502, 503, 504].includes(resp.status)) throw new Error(reason);
-      }
-      if (attempt >= retries) throw new Error(`${reason}, попытки кончились`);
-      await sleep(2 ** (attempt + 1) * 1000 + rand(0, 1000));
-    }
+  function go(url) {
+    log('переход:', url);
+    location.href = url;
   }
 
-  function trimProduct(p) {
-    const out = {};
-    for (const k of KEEP_FIELDS) if (p[k] !== undefined) out[k] = p[k];
-    out.sizes = (p.sizes || []).map((s) => ({ name: s.name, origName: s.origName, price: s.price }));
-    return out;
+  /** Ждёт следующего ответа поиска (или null по таймауту). */
+  function nextCapture(timeoutMs, fromIndex) {
+    if (captured.length > fromIndex) return Promise.resolve(captured[fromIndex]);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { onCapture = () => {}; resolve(null); }, timeoutMs);
+      onCapture = (entry) => { clearTimeout(timer); onCapture = () => {}; resolve(entry); };
+    });
   }
 
-  async function collect() {
-    const template = await findApiTemplate();
-    const pages = [];
-    for (let page = 1; page <= CONFIG.maxPages; page++) {
-      const data = await fetchJson(pageUrl(template, page));
-      const products = data.products || (data.data && data.data.products) || [];
-      status(`страница ${page}: товаров ${products.length}`);
-      console.info(`[WB-мониторинг] страница ${page}: товаров ${products.length}`);
-      if (!products.length) break;
-      pages.push({ products: products.map(trimProduct) });
-      if (page < CONFIG.maxPages) await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
+  /** Записывает пойманные страницы в сбор; возвращает true, если выдача кончилась. */
+  function absorb(run) {
+    let ended = false;
+    for (const entry of captured) {
+      if (!entry.products) continue;
+      if (!entry.products.length) { ended = true; continue; }
+      if (entry.page <= CONFIG.maxPages && !run.pages[entry.page]) run.pages[entry.page] = entry.products;
     }
-    return pages;
+    saveRun(run);
+    const count = Object.keys(run.pages).length;
+    return ended || count >= CONFIG.maxPages;
+  }
+
+  async function finish(run, note) {
+    const pages = Object.keys(run.pages).map(Number).sort((a, b) => a - b)
+      .map((n) => ({ page: n, products: run.pages[n] }));
+    status(`отправка в receiver.py: страниц ${pages.length}…`);
+    const res = await send('/ingest', { query: CONFIG.query, pages, page_url: location.href });
+    saveRun(null);
+    GM_setValue('failures', 0);
+    const intervalMs = CONFIG.intervalMin * 60000;
+    GM_setValue('lastRun', run.startedAt);
+    const text = `${fmtTime(run.startedAt)}: страниц ${pages.length}, iPhone ${res.items}, снижений ${res.drops}` +
+      (note ? `\n${note}` : '');
+    status(scheduleNext(run.startedAt + intervalMs + rand(-60000, 60000) - Date.now(), text), 'ok');
+  }
+
+  async function fail(run, message) {
+    saveRun(null);
+    const failures = GM_getValue('failures', 0) + 1;
+    GM_setValue('failures', failures);
+    log('ошибка:', message);
+    if (failures >= 2) send('/error', { message: `${message} (ошибок подряд: ${failures})` }).catch(() => {});
+    const retryMs = CONFIG.retryMin * 60000 * Math.min(failures, 6);
+    GM_setValue('lastRun', Date.now() - CONFIG.intervalMin * 60000 + retryMs);
+    status(scheduleNext(retryMs, `ошибка: ${message}`), 'error');
+  }
+
+  /** Обработка одной загрузки страницы во время сбора. */
+  async function step(run) {
+    const expected = run.expect;
+    status(`сбор: жду выдачу (страница ${expected})…`);
+    const first = await nextCapture(CONFIG.waitResponseMs, 0);
+    if (!first) {
+      run.navFailures = (run.navFailures || 0) + 1;
+      saveRun(run);
+      if (run.navFailures > 2) return fail(run, 'сайт не загрузил выдачу (нет ответа поиска)');
+      return go(searchUrl(expected));
+    }
+    const ok = captured.filter((e) => e.products);
+    if (!ok.length) {
+      const codes = [...new Set(captured.map((e) => e.status))].join(', ');
+      run.navFailures = (run.navFailures || 0) + 1;
+      saveRun(run);
+      if (run.navFailures > 3) return fail(run, `WB отклоняет запросы самого сайта: HTTP ${codes}`);
+      await sleep(rand(CONFIG.reloadDelayMs[0], CONFIG.reloadDelayMs[1]));
+      return go(searchUrl(expected));   // перезагрузка — сайт пройдёт проверку заново
+    }
+    run.navFailures = 0;
+    if (expected > 1 && !captured.some((e) => e.page === expected)) {
+      // сайт открыл не ту страницу — значит, &page=N он не поддерживает
+      absorb(run);
+      return finish(run, `сайт не открывает &page=${expected}, собрано что удалось`);
+    }
+
+    // прокрутка: сайт сам подгружает следующие страницы
+    let ended = absorb(run);
+    let lastNew = Date.now();
+    let seen = captured.length;
+    while (!ended && Date.now() - lastNew < CONFIG.scrollStallMs) {
+      pageWindow.scrollTo(0, document.documentElement.scrollHeight);
+      status(`сбор: страниц ${Object.keys(run.pages).length}, прокрутка…`);
+      await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
+      if (captured.length > seen) {
+        seen = captured.length;
+        lastNew = Date.now();
+        ended = absorb(run);
+      }
+    }
+    if (ended) return finish(run);
+
+    // прокрутка больше ничего не даёт — открываем следующую страницу по адресу
+    const have = Object.keys(run.pages).map(Number);
+    run.expect = Math.max(...have) + 1;
+    saveRun(run);
+    await sleep(rand(CONFIG.delayMinMs, CONFIG.delayMaxMs));
+    return go(searchUrl(run.expect));
   }
 
   // ----------------------------------------------------------- расписание
 
-  function scheduleReload(ms, note) {
-    const at = Date.now() + ms;
-    GM_setValue('nextRun', at);
-    console.info(`[WB-мониторинг] следующий запуск в ${fmtTime(at)}`);
-    setTimeout(() => location.reload(), ms);
+  let nextTimer;
+  function scheduleNext(ms, note) {
+    const at = Date.now() + Math.max(ms, 1000);
+    clearTimeout(nextTimer);
+    log(`следующий запуск в ${fmtTime(at)}`);
+    nextTimer = setTimeout(() => main(), at - Date.now());
     return `${note}\nследующий запуск в ${fmtTime(at)}`;
-  }
-
-  async function run() {
-    const intervalMs = CONFIG.intervalMin * 60000;
-    const started = Date.now();
-    GM_setValue('lastRun', started);
-    status('сбор выдачи…');
-    try {
-      const pages = await collect();
-      const res = await send('/ingest', { query: CONFIG.query, pages, page_url: location.href });
-      GM_setValue('failures', 0);
-      const note = `${fmtTime(started)}: страниц ${pages.length}, iPhone ${res.items}, снижений ${res.drops}`;
-      status(scheduleReload(intervalMs + rand(-60000, 60000), note), 'ok');
-    } catch (e) {
-      const failures = GM_getValue('failures', 0) + 1;
-      GM_setValue('failures', failures);
-      console.error('[WB-мониторинг]', e);
-      // протух токен — перезагрузка вкладки даст сайту пройти проверку заново
-      const retryMs = (e instanceof TokenError ? 1 : CONFIG.retryMin) * 60000 * Math.min(failures, 6);
-      if (failures >= 3 || !(e instanceof TokenError)) {
-        send('/error', { message: `${e.message} (ошибок подряд: ${failures})` }).catch(() => {});
-      }
-      GM_setValue('lastRun', Date.now() - intervalMs + retryMs);
-      status(scheduleReload(retryMs, `ошибка: ${e.message}`), 'error');
-    }
   }
 
   function isChallengePage() {
     return !!document.querySelector('script[src*="/__wbaas/challenges/"]');
   }
 
-  function start() {
+  function main() {
     if (isChallengePage()) {
       // сайт сам перезагрузится после проверки; если висит долго — вероятно, капча
       setTimeout(() => {
@@ -213,12 +326,35 @@
       }, CONFIG.challengeAlertMin * 60000);
       return;
     }
+    const run = loadRun();
+    if (run) {
+      if (Date.now() - run.startedAt > CONFIG.runTimeoutMin * 60000) {
+        return fail(run, `сбор не уложился в ${CONFIG.runTimeoutMin} мин`);
+      }
+      return step(run).catch((e) => fail(run, e.message));
+    }
     const intervalMs = CONFIG.intervalMin * 60000;
-    const due = GM_getValue('lastRun', 0) + intervalMs;
-    const wait = due - Date.now();
-    if (wait <= 60000) run();
-    else status(scheduleReload(wait, `последний запуск в ${fmtTime(GM_getValue('lastRun', 0))}`));
+    const last = GM_getValue('lastRun', 0);
+    const wait = last + intervalMs - Date.now();
+    if (wait > 60000) {
+      status(scheduleNext(wait, last ? `последний запуск в ${fmtTime(last)}` : 'ожидание'));
+      return;
+    }
+    const fresh = { startedAt: Date.now(), expect: 1, pages: {}, navFailures: 0 };
+    saveRun(fresh);
+    if (onFirstSearchPage()) return step(fresh).catch((e) => fail(fresh, e.message));
+    status('сбор: открываю выдачу…');
+    go(searchUrl(1));   // свежая загрузка, чтобы перехват поймал первую страницу
   }
 
-  start();
+  /** Открыта ли уже первая страница выдачи по нашему запросу (перехват её поймал или поймает). */
+  function onFirstSearchPage() {
+    const params = new URLSearchParams(location.search);
+    return location.pathname.endsWith('/search.aspx') &&
+      (params.get('search') || '').trim().toLowerCase() === CONFIG.query.trim().toLowerCase() &&
+      Number(params.get('page') || '1') === 1;
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', main);
+  else main();
 })();

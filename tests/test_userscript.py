@@ -1,6 +1,8 @@
 """Сквозной тест userscript: Chromium + поддельный «WB» на localhost + настоящий receiver.
 
-GM_* подменяются заглушками, GM_xmlhttpRequest пересылает запрос в receiver
+Поддельная страница сама запрашивает выдачу (как настоящий сайт): при загрузке —
+страницу из ?page=N, при прокрутке — следующие (режим scroll). GM_* подменены
+заглушками на localStorage, GM_xmlhttpRequest пересылает запрос в receiver
 через Python. Проверяется логика скрипта, а не поведение настоящего WB.
 """
 
@@ -18,9 +20,30 @@ from receiver import Receiver, make_handler
 sync_api = pytest.importorskip("playwright.sync_api")
 SCRIPT = Path(__file__).resolve().parent.parent / "wb-monitor.user.js"
 
-PAGE = """<!doctype html><html><body><h1>fake wb</h1>
-<script>fetch('/__internal/search/exactmatch/ru/common/v18/search?appType=1&dest=777&query=iphone+16&page=1');</script>
-</body></html>"""
+PAGE = """<!doctype html><html><body><h1>fake wb</h1><div id="list"></div>
+<script>
+const MODE = '%MODE%';
+let page = +(new URLSearchParams(location.search).get('page') || 1), loading = false, end = false;
+function load(p) {
+  loading = true;
+  return fetch('/__internal/search/exactmatch/ru/common/v18/search?appType=1&dest=777&query=iphone+16&page=' + p)
+    .then(r => r.ok ? r.json() : {products: []})
+    .then(d => {
+      if (!d.products.length) end = true;
+      const div = document.createElement('div');
+      div.style.height = '3000px';
+      div.textContent = 'page ' + p;
+      document.getElementById('list').appendChild(div);
+      loading = false;
+    });
+}
+load(page);
+if (MODE === 'scroll') {
+  window.addEventListener('scroll', () => {
+    if (!loading && !end && innerHeight + scrollY >= document.body.scrollHeight - 100) load(++page);
+  });
+}
+</script></body></html>"""
 
 
 def products(page):
@@ -38,18 +61,20 @@ def products(page):
 
 class FakeWB(BaseHTTPRequestHandler):
     calls: list = []
+    mode = "scroll"
     api_status = 200
 
     def do_GET(self):  # noqa: N802
         url = urlsplit(self.path)
+        status = 200
         if url.path.startswith("/__internal/search/"):
             q = parse_qs(url.query)
-            FakeWB.calls.append(q)
+            FakeWB.calls.append(int(q["page"][0]))
+            status = FakeWB.api_status
             body = json.dumps({"products": products(int(q["page"][0]))}).encode()
             ctype = "application/json"
-            status = FakeWB.api_status if len(FakeWB.calls) > 1 else 200
         else:
-            body, ctype, status = PAGE.encode(), "text/html; charset=utf-8", 200
+            body, ctype = PAGE.replace("%MODE%", FakeWB.mode).encode(), "text/html; charset=utf-8"
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -67,11 +92,12 @@ def serve(handler):
 
 
 GM_STUBS = """
-window.WB_MONITOR_CONFIG = {delayMinMs: 10, delayMaxMs: 20, maxPages: 10, receiver: 'RECEIVER'};
-const store = {secret: 'tok'};
-window.GM_getValue = (k, d) => (k in store ? store[k] : d);
-window.GM_setValue = (k, v) => { store[k] = v; };
-window.__reloads = 0;
+window.WB_MONITOR_CONFIG = {delayMinMs: 50, delayMaxMs: 100, scrollStallMs: 1500, waitResponseMs: 5000,
+                            reloadDelayMs: [50, 100], maxPages: 10, receiver: 'RECEIVER'};
+const KEY = 'gm:';
+if (!localStorage.getItem(KEY + 'secret')) localStorage.setItem(KEY + 'secret', JSON.stringify('tok'));
+window.GM_getValue = (k, d) => { const v = localStorage.getItem(KEY + k); return v === null ? d : JSON.parse(v); };
+window.GM_setValue = (k, v) => localStorage.setItem(KEY + k, JSON.stringify(v));
 window.GM_xmlhttpRequest = (o) => {
   window.pyPost(o.url, o.headers['X-Auth-Token'], o.data)
     .then((r) => o.onload({status: r.status, responseText: r.text}))
@@ -80,14 +106,13 @@ window.GM_xmlhttpRequest = (o) => {
 """
 
 
-def run_script(tmp_path, api_status=200):
-    """Прогоняет userscript в Chromium; возвращает (текст плашки, posted, sent)."""
-    sent = []
+def run_script(tmp_path, mode="scroll", api_status=200, wait_for="следующий запуск"):
+    """Прогоняет userscript; возвращает (текст плашки, отправленное в receiver, сообщения бота)."""
+    sent, posted = [], []
     rec = Receiver("tok", sent.append, tmp_path / "db.sqlite")
     rsrv, rbase = serve(make_handler(rec))
+    FakeWB.calls, FakeWB.mode, FakeWB.api_status = [], mode, api_status
     wsrv, wbase = serve(FakeWB)
-    FakeWB.calls, FakeWB.api_status = [], api_status
-    posted = []
     try:
         with sync_api.sync_playwright() as pw:
             try:
@@ -103,10 +128,12 @@ def run_script(tmp_path, api_status=200):
                 return {"status": r.status_code, "text": r.text}
 
             page.expose_function("pyPost", py_post)
+            # как у менеджера userscript: заглушки и скрипт — до скриптов страницы, на каждой загрузке
             page.add_init_script(GM_STUBS.replace("RECEIVER", rbase))
+            page.add_init_script(SCRIPT.read_text(encoding="utf-8"))
             page.goto(wbase + "/catalog/0/search.aspx?search=iPhone%2016#wb-monitor")
-            page.add_script_tag(content=SCRIPT.read_text(encoding="utf-8"))
-            page.wait_for_function("() => document.body.innerText.includes('следующий запуск')", timeout=30000)
+            page.wait_for_function(
+                f"() => document.body && document.body.innerText.includes({json.dumps(wait_for)})", timeout=60000)
             badge = page.inner_text("body")
             browser.close()
     finally:
@@ -115,20 +142,30 @@ def run_script(tmp_path, api_status=200):
     return badge, posted, sent
 
 
-def test_userscript_end_to_end(tmp_path):
-    badge, posted, sent = run_script(tmp_path)
-    assert "страниц 3, iPhone 3, снижений 0" in badge
-    # шаблон URL взят из запроса самой страницы (dest=777), query/page — свои
-    assert [c["page"][0] for c in FakeWB.calls if "dest" in c][-4:] == ["1", "2", "3", "4"]
-    assert all(c["dest"] == ["777"] and c["query"] == ["iPhone 16"] for c in FakeWB.calls[1:])
+def check_ingest(posted, sent):
+    assert len(posted) == 1
     url, body = posted[0]
-    assert url.endswith("/ingest") and len(body["pages"]) == 3
+    assert url.endswith("/ingest") and [p["page"] for p in body["pages"]] == [1, 2, 3]
     prod = body["pages"][0]["products"][0]
     assert "extraHeavyField" not in prod and "stocks" not in prod["sizes"][0]  # лишнее обрезано
     assert "База создана" in sent[0]
 
 
-def test_userscript_token_rejected(tmp_path):
-    badge, posted, sent = run_script(tmp_path, api_status=498)
-    assert "ошибка: WB отклонил запрос: HTTP 498" in badge
-    assert posted == [] and sent == []  # первая такая ошибка — только перезагрузка через минуту
+def test_infinite_scroll(tmp_path):
+    badge, posted, sent = run_script(tmp_path, "scroll")
+    assert "страниц 3, iPhone 3, снижений 0" in badge
+    assert FakeWB.calls == [1, 2, 3, 4]   # скрипт сам ничего не запрашивал — только сайт
+    check_ingest(posted, sent)
+
+
+def test_page_navigation_fallback(tmp_path):
+    badge, posted, sent = run_script(tmp_path, "pages")
+    assert "страниц 3, iPhone 3" in badge
+    assert FakeWB.calls == [1, 2, 3, 4]
+    check_ingest(posted, sent)
+
+
+def test_site_requests_rejected(tmp_path):
+    badge, posted, sent = run_script(tmp_path, "scroll", api_status=403, wait_for="ошибка")
+    assert "WB отклоняет запросы самого сайта: HTTP 403" in badge
+    assert posted == [] and sent == []    # первая ошибка — без уведомления, повтор позже
